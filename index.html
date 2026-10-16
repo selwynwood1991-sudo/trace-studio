@@ -1,0 +1,328 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<title>Selwyn’s Trace Studio</title>
+<style>
+  :root {
+    --panel: rgba(24, 26, 32, .94);
+    --btn: #3b404c;
+    --accent: #ffc933;
+    --accent-ink: #231a00;
+    --lock: #ff5a5f;
+    --text: #f4f5f7;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; -webkit-user-select: none; user-select: none; -webkit-tap-highlight-color: transparent; }
+  html, body { height: 100%; }
+  body { background: #000; color: var(--text); font-family: ui-rounded, "SF Pro Rounded", system-ui, sans-serif; overflow: hidden; }
+
+  #stage { position: fixed; inset: 0; background: #000; touch-action: none; }
+  video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+  #traceImage {
+    position: absolute; top: 50%; left: 50%;
+    width: 80%; height: 80%; object-fit: contain;
+    transform: translate(-50%, -50%);
+    pointer-events: none; display: none;
+    filter: grayscale(1) contrast(1.2);
+    opacity: .55;
+  }
+
+  #status {
+    position: fixed; top: calc(10px + env(safe-area-inset-top)); left: 10px; right: 10px; z-index: 10;
+    font-size: 14px; line-height: 1.35; padding: 8px 12px; border-radius: 12px;
+    background: rgba(0,0,0,.55); width: fit-content; max-width: calc(100% - 20px);
+    pointer-events: none;
+  }
+
+  #controls {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 10;
+    background: var(--panel); touch-action: manipulation;
+    padding: 12px 12px calc(12px + env(safe-area-inset-bottom));
+    display: flex; flex-direction: column; gap: 10px;
+  }
+  #controls.collapsed { display: none; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; align-items: center; }
+
+  button {
+    background: var(--btn); color: var(--text); border: none;
+    padding: 11px 14px; border-radius: 12px;
+    font: inherit; font-size: 15px; font-weight: 600; cursor: pointer;
+  }
+  button:active { transform: scale(.97); }
+  button.primary { background: var(--accent); color: var(--accent-ink); }
+  button.locked { background: var(--lock); color: #fff; }
+  button:focus-visible, input:focus-visible { outline: 3px solid #fff; outline-offset: 2px; }
+
+  label { display: flex; align-items: center; gap: 8px; font-size: 14px; font-weight: 600; }
+  input[type=range] { width: 140px; accent-color: var(--accent); }
+  #pickImage { display: none; }
+
+  #showBtn {
+    position: fixed; right: 12px; bottom: calc(12px + env(safe-area-inset-bottom)); z-index: 10;
+    display: none; background: var(--panel);
+  }
+  #showBtn.visible { display: block; }
+
+  @media (prefers-reduced-motion: reduce) { button:active { transform: none; } }
+</style>
+</head>
+<body>
+
+<div id="stage">
+  <video id="camera" autoplay playsinline muted></video>
+  <img id="traceImage" alt="">
+</div>
+
+<div id="status" role="status">Starting camera…</div>
+
+<div id="controls">
+  <div class="row">
+    <button id="pickBtn" class="primary">Pick picture</button>
+    <input type="file" id="pickImage" accept="image/*">
+    <button id="lockBtn">Lock</button>
+    <button id="styleBtn">Look: Grey</button>
+    <button id="flipBtn">Flip</button>
+    <button id="centerBtn">Centre</button>
+    <button id="fullBtn">Fullscreen</button>
+    <button id="hideBtn">Hide controls</button>
+  </div>
+  <div class="row">
+    <label>See-through <input type="range" id="opacity" min="10" max="100" value="55"></label>
+    <label>Size <input type="range" id="size" min="10" max="300" value="70"></label>
+  </div>
+</div>
+<button id="showBtn">Show controls</button>
+
+<script>
+const $ = id => document.getElementById(id);
+const video = $('camera'), image = $('traceImage'), statusEl = $('status');
+const lockBtn = $('lockBtn'), styleBtn = $('styleBtn'), sizeInput = $('size'), controls = $('controls'), showBtn = $('showBtn');
+const stage = $('stage');
+
+// ---- State ----
+let scale = 0.7, rotation = 0, x = 0, y = 0, flipped = false, locked = false;
+let hasImage = false;
+let originalUrl = null, linesUrl = null;
+const MODES = ['grey', 'colour', 'lines'];
+const MODE_LABEL = { grey: 'Grey', colour: 'Colour', lines: 'Lines' };
+let mode = 'grey';
+
+function say(msg) { statusEl.textContent = msg; }
+
+// ---- Camera ----
+async function startCamera() {
+  if (!window.isSecureContext || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    say('The camera needs a secure page. Open this file from an https:// address.');
+    return;
+  }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: 'environment' } },
+      audio: false
+    });
+    video.srcObject = stream;
+    say('Camera ready. Pick a picture to trace.');
+    keepAwake();
+  } catch (err) {
+    say(err && err.name === 'NotAllowedError'
+      ? 'Camera is blocked. Allow camera access in the browser settings, then refresh.'
+      : 'Could not start the camera. Check that no other app is using it, then refresh.');
+  }
+}
+
+// ---- Keep the screen on while tracing ----
+async function keepAwake() {
+  try { if ('wakeLock' in navigator) await navigator.wakeLock.request('screen'); } catch (e) {}
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') keepAwake();
+});
+
+// ---- Picture ----
+$('pickBtn').addEventListener('click', () => $('pickImage').click());
+
+$('pickImage').addEventListener('change', e => {
+  const file = e.target.files[0];
+  if (!file) return;
+  if (originalUrl) URL.revokeObjectURL(originalUrl);
+  originalUrl = URL.createObjectURL(file);
+  linesUrl = null;
+  hasImage = true;
+  image.style.display = 'block';
+  applyMode();
+  say('Drag to move. Pinch to resize. Twist to rotate.');
+});
+
+function updateImage() {
+  const sx = flipped ? -scale : scale;
+  image.style.transform =
+    `translate(calc(-50% + ${x}px), calc(-50% + ${y}px)) rotate(${rotation}deg) scale(${sx}, ${scale})`;
+  sizeInput.value = Math.round(scale * 100);
+}
+
+// ---- Looks: grey, colour, lines ----
+function applyMode() {
+  if (!hasImage) return;
+  if (mode === 'lines') {
+    if (!linesUrl) {
+      const tmp = new Image();
+      tmp.onload = () => { linesUrl = makeLines(tmp); applyMode(); };
+      tmp.src = originalUrl;
+      say('Drawing the outline…');
+      return;
+    }
+    image.src = linesUrl;
+    image.style.filter = 'none';
+  } else {
+    image.src = originalUrl;
+    image.style.filter = mode === 'grey' ? 'grayscale(1) contrast(1.2)' : 'none';
+  }
+  styleBtn.textContent = 'Look: ' + MODE_LABEL[mode];
+}
+
+// Edge detection (Sobel): dark lines on a see-through background
+function makeLines(img) {
+  const r = Math.min(1, 900 / Math.max(img.naturalWidth, img.naturalHeight));
+  const w = Math.max(1, Math.round(img.naturalWidth * r));
+  const h = Math.max(1, Math.round(img.naturalHeight * r));
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  const ctx = c.getContext('2d', { willReadFrequently: true });
+  ctx.drawImage(img, 0, 0, w, h);
+  const src = ctx.getImageData(0, 0, w, h), d = src.data;
+  const g = new Float32Array(w * h);
+  for (let i = 0; i < w * h; i++) {
+    g[i] = d[i*4] * 0.299 + d[i*4+1] * 0.587 + d[i*4+2] * 0.114;
+  }
+  const out = ctx.createImageData(w, h), o = out.data;
+  for (let j = 1; j < h - 1; j++) {
+    for (let i = 1; i < w - 1; i++) {
+      const p = j * w + i;
+      const gx = -g[p-w-1] - 2*g[p-1] - g[p+w-1] + g[p-w+1] + 2*g[p+1] + g[p+w+1];
+      const gy = -g[p-w-1] - 2*g[p-w] - g[p-w+1] + g[p+w-1] + 2*g[p+w] + g[p+w+1];
+      const mag = Math.hypot(gx, gy);
+      o[p*4+3] = Math.max(0, Math.min(255, (mag - 40) * 2.5));
+    }
+  }
+  ctx.putImageData(out, 0, 0);
+  say('Drag to move. Pinch to resize. Twist to rotate.');
+  return c.toDataURL('image/png');
+}
+
+styleBtn.addEventListener('click', () => {
+  mode = MODES[(MODES.indexOf(mode) + 1) % MODES.length];
+  styleBtn.textContent = 'Look: ' + MODE_LABEL[mode];
+  applyMode();
+});
+
+// ---- Sliders and buttons ----
+$('opacity').addEventListener('input', e => { image.style.opacity = e.target.value / 100; });
+
+sizeInput.addEventListener('input', e => {
+  scale = e.target.value / 100;
+  updateImage();
+});
+
+$('flipBtn').addEventListener('click', () => { flipped = !flipped; updateImage(); });
+
+$('centerBtn').addEventListener('click', () => {
+  x = 0; y = 0; rotation = 0; scale = 0.7;
+  updateImage();
+});
+
+lockBtn.addEventListener('click', () => {
+  locked = !locked;
+  pts.clear(); gesture = null;
+  lockBtn.textContent = locked ? 'Unlock' : 'Lock';
+  lockBtn.classList.toggle('locked', locked);
+  say(locked ? 'Locked. Trace the lines.' : 'Unlocked. Move the picture.');
+});
+
+const fullBtn = $('fullBtn');
+if (!document.fullscreenEnabled) {
+  fullBtn.style.display = 'none';   // e.g. iPhone Safari
+} else {
+  fullBtn.addEventListener('click', () => {
+    if (!document.fullscreenElement) document.documentElement.requestFullscreen();
+    else document.exitFullscreen();
+  });
+}
+
+$('hideBtn').addEventListener('click', () => { controls.classList.add('collapsed'); showBtn.classList.add('visible'); });
+showBtn.addEventListener('click', () => { controls.classList.remove('collapsed'); showBtn.classList.remove('visible'); });
+
+// ---- Touch and mouse: one pointer moves, two pointers pinch and twist ----
+const pts = new Map();
+let gesture = null;
+
+function startGesture() {
+  const p = [...pts.values()];
+  if (p.length === 1) {
+    gesture = { kind: 1, sx: p[0].x, sy: p[0].y, ix: x, iy: y };
+  } else if (p.length >= 2) {
+    const [a, b] = p;
+    gesture = {
+      kind: 2,
+      dist: Math.hypot(a.x - b.x, a.y - b.y),
+      ang: Math.atan2(b.y - a.y, b.x - a.x),
+      s: scale,
+      mx: (a.x + b.x) / 2, my: (a.y + b.y) / 2,
+      ix: x, iy: y
+    };
+  } else {
+    gesture = null;
+  }
+}
+
+stage.addEventListener('pointerdown', e => {
+  if (locked || !hasImage) return;
+  stage.setPointerCapture(e.pointerId);
+  pts.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  startGesture();
+});
+
+stage.addEventListener('pointermove', e => {
+  if (!pts.has(e.pointerId) || !gesture) return;
+  pts.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  const p = [...pts.values()];
+
+  if (gesture.kind === 1 && p.length === 1) {
+    x = gesture.ix + p[0].x - gesture.sx;
+    y = gesture.iy + p[0].y - gesture.sy;
+  } else if (gesture.kind === 2 && p.length >= 2) {
+    const [a, b] = p;
+    const dist = Math.hypot(a.x - b.x, a.y - b.y);
+    const ang = Math.atan2(b.y - a.y, b.x - a.x);
+    let da = ang - gesture.ang;
+    da = Math.atan2(Math.sin(da), Math.cos(da));      // avoid a jump at ±180°
+    rotation += da * 180 / Math.PI;
+    gesture.ang = ang;
+    scale = Math.min(3, Math.max(0.1, gesture.s * dist / gesture.dist));
+    x = gesture.ix + (a.x + b.x) / 2 - gesture.mx;     // two fingers also move it
+    y = gesture.iy + (a.y + b.y) / 2 - gesture.my;
+  }
+  updateImage();
+});
+
+function endPointer(e) {
+  if (!pts.has(e.pointerId)) return;
+  pts.delete(e.pointerId);
+  startGesture();     // re-base so the picture never jumps when a finger lifts
+}
+stage.addEventListener('pointerup', endPointer);
+stage.addEventListener('pointercancel', endPointer);
+
+// Mouse wheel zoom on desktop
+stage.addEventListener('wheel', e => {
+  if (locked || !hasImage) return;
+  e.preventDefault();
+  scale = Math.min(3, Math.max(0.1, scale * (e.deltaY < 0 ? 1.06 : 0.94)));
+  updateImage();
+}, { passive: false });
+
+updateImage();
+startCamera();
+</script>
+</body>
+</html>
